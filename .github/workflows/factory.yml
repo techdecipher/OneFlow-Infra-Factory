@@ -1,0 +1,128 @@
+name: OneFlow Project Factory
+on:
+  push:
+    branches: [ main ]
+    paths: [ "projects.json" ]
+
+permissions:
+  contents: read
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    env:
+      TEMPLATE_OWNER: techdecipher       # <-- change to your org/user
+      TEMPLATE_REPO:  oneflow-template   # <-- template repo name
+      STATE_BUCKET_PREFIX: oneflow-tf-   # per-project bucket: oneflow-tf-<repo>-state
+      DEFAULT_REGION: ap-south-1         # fallback if region missing
+    steps:
+      - name: Checkout (full history for diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+          jq --version
+          gh --version || echo "gh is preinstalled"
+          aws --version || echo "aws is preinstalled"
+
+      - name: Compute new projects (diff by keys)
+        id: diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          BEFORE="${{ github.event.before }}"
+          if git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            git show "${BEFORE}:projects.json" > /tmp/before.json || echo "{}" > /tmp/before.json
+          else
+            echo "{}" > /tmp/before.json
+          fi
+          cp projects.json /tmp/after.json
+
+          # Extract ID->object with {name,region}; tolerate string form too
+          normalize='to_entries
+            | map({key:.key, value:(if (.value|type)=="object"
+                                      then {name:.value.name, region:(.value.region // "")}
+                                      else {name:.value, region:""} end)})'
+
+          jq -r "$normalize" /tmp/before.json > /tmp/b_norm.json
+          jq -r "$normalize" /tmp/after.json  > /tmp/a_norm.json
+
+          jq -r '.[].key' /tmp/b_norm.json | sort -u > /tmp/old_ids.txt || true
+          jq -r '.[].key' /tmp/a_norm.json | sort -u > /tmp/new_ids.txt
+          comm -13 /tmp/old_ids.txt /tmp/new_ids.txt > /tmp/add_ids.txt
+
+          # Build array of new entries (resolve by key)
+          NEW=$(jq -c --slurpfile add /tmp/add_ids.txt '
+            (input) as $after
+            | ($add[0] // []) as $ids
+            | [ $after[] | select(.key as $k | ($ids | index($k))) | .value ]
+          ' /tmp/a_norm.json)
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          echo "New entries: $NEW"
+
+      - name: Stop if nothing to create
+        if: steps.diff.outputs.new == '[]' || steps.diff.outputs.new == ''
+        run: echo "No new projects. Done."
+
+      - name: Provision each new repo
+        if: steps.diff.outputs.new != '[]' && steps.diff.outputs.new != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}                # PAT with repo+workflow
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          NEW='${{ steps.diff.outputs.new }}'
+          echo "$NEW" | jq -c '.[]' | while read -r item; do
+            NAME=$(echo "$item" | jq -r '.name')
+            REGION=$(echo "$item" | jq -r '.region')
+            [ -z "$NAME" ] && continue
+            [ -z "$REGION" ] && REGION="${DEFAULT_REGION}"
+
+            echo "=== Creating project: $NAME (region: $REGION) ==="
+
+            # 1) Create repo from template (PUBLIC)
+            gh repo create "${{ github.repository_owner }}/$NAME" \
+              --public --template "${TEMPLATE_OWNER}/${TEMPLATE_REPO}" --confirm
+
+            # 2) Create 'staging' branch from main head
+            MAIN_SHA=$(gh api repos/${{ github.repository_owner }}/$NAME/git/ref/heads/main --jq '.object.sha')
+            gh api repos/${{ github.repository_owner }}/$NAME/git/refs \
+              -X POST -f ref="refs/heads/staging" -f sha="$MAIN_SHA"
+
+            # 3) Create per-project S3 state bucket (regional)
+            BUCKET="${STATE_BUCKET_PREFIX}${NAME}-state"
+            echo "Ensuring S3 bucket: $BUCKET ($REGION)"
+            if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+              echo "Bucket exists."
+            else
+              if [ "$REGION" = "us-east-1" ]; then
+                aws s3api create-bucket --bucket "$BUCKET"
+              else
+                aws s3api create-bucket --bucket "$BUCKET" \
+                  --create-bucket-configuration LocationConstraint="$REGION"
+              fi
+              aws s3api put-bucket-versioning --bucket "$BUCKET" \
+                --versioning-configuration Status=Enabled
+              aws s3api put-public-access-block --bucket "$BUCKET" \
+                --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+              aws s3api put-bucket-encryption --bucket "$BUCKET" \
+                --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+            fi
+
+            # 4) Set repo Variables for template workflows
+            gh variable set AWS_REGION      --repo "${{ github.repository_owner }}/$NAME" --body "$REGION"
+            gh variable set TF_STATE_BUCKET --repo "${{ github.repository_owner }}/$NAME" --body "$BUCKET"
+            gh variable set PROJECT_NAME    --repo "${{ github.repository_owner }}/$NAME" --body "$NAME"
+
+            # 5) Set repo Secrets for plan/apply
+            gh secret set AWS_ACCESS_KEY_ID     --repo "${{ github.repository_owner }}/$NAME" --body "$AWS_ACCESS_KEY_ID"
+            gh secret set AWS_SECRET_ACCESS_KEY --repo "${{ github.repository_owner }}/$NAME" --body "$AWS_SECRET_ACCESS_KEY"
+
+            echo "=== $NAME provisioned. ==="
+          done
